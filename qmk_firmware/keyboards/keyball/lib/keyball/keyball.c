@@ -33,6 +33,8 @@ const uint16_t AML_TIMEOUT_MIN = 100;
 const uint16_t AML_TIMEOUT_MAX = 1000;
 const uint16_t AML_TIMEOUT_QU  = 50;   // Quantization Unit
 
+const uint16_t AML_ACTIVATE_THRESHOLD = 50;
+
 static const char BL = '\xB0'; // Blank indicator character
 static const char LFSTR_ON[] PROGMEM = "\xB2\xB3";
 static const char LFSTR_OFF[] PROGMEM = "\xB4\xB5";
@@ -50,6 +52,9 @@ keyball_t keyball = {
 
     .scroll_mode = false,
     .scroll_div  = 0,
+
+    .last_layer_state = 0,
+    .total_mouse_movement = 0,
 
     .pressing_keys = { BL, BL, BL, BL, BL, BL, 0 },
 };
@@ -130,6 +135,10 @@ static void add_scroll_div(int8_t delta) {
     keyball_set_scroll_div(v < 1 ? 1 : v);
 }
 
+static uint16_t movement_size_of(report_mouse_t *rep) {
+    return abs(rep->x) + abs(rep->y);
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // Pointing device driver
 
@@ -166,6 +175,30 @@ void pointing_device_driver_set_cpi(uint16_t cpi) {
     keyball_set_cpi(cpi);
 }
 
+static void adjust_mouse_speed(report_mouse_t *r) {
+    uint16_t movement_size = movement_size_of(r);
+
+    float speed_factor = 1.0;
+    if (movement_size > 60) {
+        speed_factor = 3.0;
+    } else if (movement_size > 30) {
+        speed_factor = 1.5;
+    } else if (movement_size > 5) {
+        speed_factor = 1.0;
+    } else if (movement_size > 4) {
+        speed_factor = 0.9;
+    } else if (movement_size > 3) {
+        speed_factor = 0.7;
+    } else if (movement_size > 2) {
+        speed_factor = 0.5;
+    } else if (movement_size > 1) {
+        speed_factor = 0.2;
+    }
+
+    r->x = clip2int8(r->x * speed_factor);
+    r->y = clip2int8(r->y * speed_factor);
+}
+
 __attribute__((weak)) void keyball_on_apply_motion_to_mouse_move(keyball_motion_t *m, report_mouse_t *r, bool is_left) {
 #if KEYBALL_MODEL == 61 || KEYBALL_MODEL == 39 || KEYBALL_MODEL == 147 || KEYBALL_MODEL == 44
     r->x = clip2int8(m->y);
@@ -180,6 +213,7 @@ __attribute__((weak)) void keyball_on_apply_motion_to_mouse_move(keyball_motion_
 #else
 #    error("unknown Keyball model")
 #endif
+    adjust_mouse_speed(r);
     // clear motion
     m->x = 0;
     m->y = 0;
@@ -263,6 +297,41 @@ static inline bool should_report(void) {
 #endif
     return true;
 }
+
+#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+static uint16_t keyball_get_auto_mouse_timeout(void) {
+    return keyball.auto_mouse_layer_timeout;
+}
+
+static void keyball_set_auto_mouse_timeout(uint16_t timeout) {
+    keyball.auto_mouse_layer_timeout = timeout;
+}
+
+static uint16_t get_auto_mouse_keep_time(void) {
+#ifdef AUTO_MOUSE_LAYER_KEEP_TIME
+        return AUTO_MOUSE_LAYER_KEEP_TIME;
+#else
+        return keyball_get_auto_mouse_timeout();
+#endif
+}
+
+// override qmk function:
+//  https://github.com/qmk/qmk_firmware/blob/0.22.14/quantum/pointing_device/pointing_device_auto_mouse.c#L208-L221
+// activate auto mouse layer when mouse movement exceeds the threshold.
+bool auto_mouse_activation(report_mouse_t mouse_report) {
+    keyball.total_mouse_movement += movement_size_of(&mouse_report);
+    if (AML_ACTIVATE_THRESHOLD < keyball.total_mouse_movement) {
+        keyball.total_mouse_movement = 0;
+        if (get_auto_mouse_timeout() != get_auto_mouse_keep_time()) {
+            // keep AML if mouse is moving with "short timeout".
+            set_auto_mouse_timeout(get_auto_mouse_keep_time());
+        }
+        return true;
+    } else {
+        return mouse_report.buttons;
+    }
+}
+#endif
 
 report_mouse_t pointing_device_driver_get_report(report_mouse_t rep) {
     // fetch from optical sensor.
@@ -411,7 +480,7 @@ void keyball_oled_render_ballinfo(void) {
     oled_write(format_4d(keyball_get_cpi()) + 1, false);
     oled_write_P(PSTR("00 "), false);
 
-    // indicate scroll snap mode: "VT" (vertical), "HO" (horizontal), and "SCR" (free)
+    // indicate scroll snap mode: "VT" (vertical), "HN" (horiozntal), and "SCR" (free)
 #if 1 && KEYBALL_SCROLLSNAP_ENABLE == 2
     switch (keyball_get_scrollsnap_mode()) {
         case KEYBALL_SCROLLSNAP_MODE_VERTICAL:
@@ -503,7 +572,7 @@ void keyball_oled_render_layerinfo(void) {
         oled_write_P(LFSTR_OFF, false);
     }
 
-    oled_write(format_4d(get_auto_mouse_timeout() / 10) + 1, false);
+    oled_write(format_4d(keyball_get_auto_mouse_timeout() / 10) + 1, false);
     oled_write_char('0', false);
 #    else
     oled_write_P(PSTR("\xC2\xC3\xB4\xB5 ---"), false);
@@ -562,6 +631,21 @@ void keyball_set_cpi(uint8_t cpi) {
     }
 }
 
+#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+void keyball_handle_auto_mouse_layer_change(layer_state_t state) {
+    layer_state_t last_state = keyball.last_layer_state;
+    // go into AML
+    if (!layer_state_cmp(last_state, AUTO_MOUSE_DEFAULT_LAYER) && layer_state_cmp(state, AUTO_MOUSE_DEFAULT_LAYER)) {
+        keyball.total_mouse_movement = 0;
+    } // go out AML
+    else if (layer_state_cmp(last_state, AUTO_MOUSE_DEFAULT_LAYER) && !layer_state_cmp(state, AUTO_MOUSE_DEFAULT_LAYER)) {
+        set_auto_mouse_timeout(get_auto_mouse_keep_time());
+        keyball.total_mouse_movement = 0;
+    }
+    keyball.last_layer_state = state;
+}
+#endif
+
 //////////////////////////////////////////////////////////////////////////////
 // Keyboard hooks
 
@@ -582,7 +666,7 @@ void keyboard_post_init_kb(void) {
         keyball_set_scroll_div(c.sdiv);
 #ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
         set_auto_mouse_enable(c.amle);
-        set_auto_mouse_timeout(c.amlto == 0 ? AUTO_MOUSE_TIME : (c.amlto + 1) * AML_TIMEOUT_QU);
+        keyball_set_auto_mouse_timeout(c.amlto == 0 ? AUTO_MOUSE_TIME : (c.amlto + 1) * AML_TIMEOUT_QU);
 #endif
 #if KEYBALL_SCROLLSNAP_ENABLE == 2
         keyball_set_scrollsnap_mode(c.ssnap);
@@ -651,6 +735,14 @@ bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
         keycode &= 0xff;
     }
 
+#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+    // reduce auto mouse timeout if mouse key is pressed.
+    if ((is_mouse_record_kb(keycode, record) || IS_MOUSEKEY(keycode)) && record->event.pressed) {
+        set_auto_mouse_timeout(keyball_get_auto_mouse_timeout());
+        keyball.total_mouse_movement = 0;
+    }
+#endif
+
     switch (keycode) {
 #ifndef MOUSEKEY_ENABLE
         // process KC_MS_BTN1~8 by myself
@@ -687,7 +779,7 @@ bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
                     .sdiv  = keyball.scroll_div,
 #ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
                     .amle  = get_auto_mouse_enable(),
-                    .amlto = (get_auto_mouse_timeout() / AML_TIMEOUT_QU) - 1,
+                    .amlto = (keyball_get_auto_mouse_timeout() / AML_TIMEOUT_QU) - 1,
 #endif
 #if KEYBALL_SCROLLSNAP_ENABLE == 2
                     .ssnap = keyball_get_scrollsnap_mode(),
@@ -737,14 +829,14 @@ bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
                 break;
             case AML_I50:
                 {
-                    uint16_t v = get_auto_mouse_timeout() + 50;
-                    set_auto_mouse_timeout(MIN(v, AML_TIMEOUT_MAX));
+                    uint16_t v = keyball_get_auto_mouse_timeout() + 50;
+                    keyball_set_auto_mouse_timeout(MIN(v, AML_TIMEOUT_MAX));
                 }
                 break;
             case AML_D50:
                 {
-                    uint16_t v = get_auto_mouse_timeout() - 50;
-                    set_auto_mouse_timeout(MAX(v, AML_TIMEOUT_MIN));
+                    uint16_t v = keyball_get_auto_mouse_timeout() - 50;
+                    keyball_set_auto_mouse_timeout(MAX(v, AML_TIMEOUT_MIN));
                 }
                 break;
 #endif
